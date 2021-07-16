@@ -105,7 +105,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_errors::{pluralize, struct_span_err, Applicability};
 use rustc_hir as hir;
 use rustc_hir::def::Res;
-use rustc_hir::def_id::{CrateNum, DefId, LocalDefId, LOCAL_CRATE};
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::Visitor;
 use rustc_hir::itemlikevisit::ItemLikeVisitor;
 use rustc_hir::{HirIdMap, ImplicitSelfKind, Node};
@@ -116,14 +116,13 @@ use rustc_middle::ty::fold::{TypeFoldable, TypeFolder};
 use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::subst::GenericArgKind;
 use rustc_middle::ty::subst::{InternalSubsts, Subst, SubstsRef};
-use rustc_middle::ty::WithConstness;
 use rustc_middle::ty::{self, RegionKind, Ty, TyCtxt, UserType};
 use rustc_session::config;
 use rustc_session::parse::feature_err;
 use rustc_session::Session;
-use rustc_span::source_map::DUMMY_SP;
 use rustc_span::symbol::{kw, Ident};
 use rustc_span::{self, BytePos, MultiSpan, Span};
+use rustc_span::{source_map::DUMMY_SP, sym};
 use rustc_target::abi::VariantIdx;
 use rustc_target::spec::abi::Abi;
 use rustc_trait_selection::traits;
@@ -175,13 +174,12 @@ impl Needs {
 pub struct UnsafetyState {
     pub def: hir::HirId,
     pub unsafety: hir::Unsafety,
-    pub unsafe_push_count: u32,
     from_fn: bool,
 }
 
 impl UnsafetyState {
     pub fn function(unsafety: hir::Unsafety, def: hir::HirId) -> UnsafetyState {
-        UnsafetyState { def, unsafety, unsafe_push_count: 0, from_fn: true }
+        UnsafetyState { def, unsafety, from_fn: true }
     }
 
     pub fn recurse(self, blk: &hir::Block<'_>) -> UnsafetyState {
@@ -194,19 +192,11 @@ impl UnsafetyState {
             hir::Unsafety::Unsafe if self.from_fn => self,
 
             unsafety => {
-                let (unsafety, def, count) = match blk.rules {
-                    BlockCheckMode::PushUnsafeBlock(..) => {
-                        (unsafety, blk.hir_id, self.unsafe_push_count.checked_add(1).unwrap())
-                    }
-                    BlockCheckMode::PopUnsafeBlock(..) => {
-                        (unsafety, blk.hir_id, self.unsafe_push_count.checked_sub(1).unwrap())
-                    }
-                    BlockCheckMode::UnsafeBlock(..) => {
-                        (hir::Unsafety::Unsafe, blk.hir_id, self.unsafe_push_count)
-                    }
-                    BlockCheckMode::DefaultBlock => (unsafety, self.def, self.unsafe_push_count),
+                let (unsafety, def) = match blk.rules {
+                    BlockCheckMode::UnsafeBlock(..) => (hir::Unsafety::Unsafe, blk.hir_id),
+                    BlockCheckMode::DefaultBlock => (unsafety, self.def),
                 };
-                UnsafetyState { def, unsafety, unsafe_push_count: count, from_fn: false }
+                UnsafetyState { def, unsafety, from_fn: false }
             }
         }
     }
@@ -495,8 +485,9 @@ fn typeck_with_fallback<'tcx>(
         let fcx = if let (Some(header), Some(decl)) = (fn_header, fn_decl) {
             let fn_sig = if crate::collect::get_infer_ret_ty(&decl.output).is_some() {
                 let fcx = FnCtxt::new(&inh, param_env, body.value.hir_id);
-                AstConv::ty_of_fn(
+                <dyn AstConv<'_>>::ty_of_fn(
                     &fcx,
+                    id,
                     header.unsafety,
                     header.abi,
                     decl,
@@ -508,7 +499,7 @@ fn typeck_with_fallback<'tcx>(
                 tcx.fn_sig(def_id)
             };
 
-            check_abi(tcx, span, fn_sig.abi());
+            check_abi(tcx, id, span, fn_sig.abi());
 
             // Compute the fty from point of view of inside the fn.
             let fn_sig = tcx.liberate_late_bound_regions(def_id.to_def_id(), fn_sig);
@@ -527,7 +518,7 @@ fn typeck_with_fallback<'tcx>(
             let fcx = FnCtxt::new(&inh, param_env, body.value.hir_id);
             let expected_type = body_ty
                 .and_then(|ty| match ty.kind {
-                    hir::TyKind::Infer => Some(AstConv::ast_ty_to_ty(&fcx, ty)),
+                    hir::TyKind::Infer => Some(<dyn AstConv<'_>>::ast_ty_to_ty(&fcx, ty)),
                     _ => None,
                 })
                 .unwrap_or_else(|| match tcx.hir().get(id) {
@@ -539,6 +530,24 @@ fn typeck_with_fallback<'tcx>(
                             kind: TypeVariableOriginKind::TypeInference,
                             span,
                         }),
+                        Node::Ty(&hir::Ty {
+                            kind: hir::TyKind::Typeof(ref anon_const), ..
+                        }) if anon_const.hir_id == id => fcx.next_ty_var(TypeVariableOrigin {
+                            kind: TypeVariableOriginKind::TypeInference,
+                            span,
+                        }),
+                        Node::Expr(&hir::Expr { kind: hir::ExprKind::InlineAsm(asm), .. })
+                        | Node::Item(&hir::Item { kind: hir::ItemKind::GlobalAsm(asm), .. })
+                            if asm.operands.iter().any(|(op, _op_sp)| match op {
+                                hir::InlineAsmOperand::Const { anon_const } => {
+                                    anon_const.hir_id == id
+                                }
+                                _ => false,
+                            }) =>
+                        {
+                            // Inline assembly constants must be integers.
+                            fcx.next_int_var()
+                        }
                         _ => fallback(),
                     },
                     _ => fallback(),
@@ -547,11 +556,12 @@ fn typeck_with_fallback<'tcx>(
             let expected_type = fcx.normalize_associated_types_in(body.value.span, expected_type);
             fcx.require_type_is_sized(expected_type, body.value.span, traits::ConstSized);
 
-            let revealed_ty = if tcx.features().impl_trait_in_bindings {
-                fcx.instantiate_opaque_types_from_value(id, expected_type, body.value.span)
-            } else {
-                expected_type
-            };
+            let revealed_ty = fcx.instantiate_opaque_types_from_value(
+                id,
+                expected_type,
+                body.value.span,
+                Some(sym::impl_trait_in_bindings),
+            );
 
             // Gather locals in statics (because of block expressions).
             GatherLocalsVisitor::new(&fcx, id).visit_body(body);
@@ -839,7 +849,7 @@ fn missing_items_err(
     // Obtain the level of indentation ending in `sugg_sp`.
     let indentation = tcx.sess.source_map().span_to_margin(sugg_sp).unwrap_or(0);
     // Make the whitespace that will make the suggestion have the right indentation.
-    let padding: String = std::iter::repeat(" ").take(indentation).collect();
+    let padding: String = " ".repeat(indentation);
 
     for trait_item in missing_items {
         let snippet = suggestion_signature(&trait_item, tcx);
@@ -1010,7 +1020,7 @@ fn suggestion_signature(assoc: &ty::AssocItem, tcx: TyCtxt<'_>) -> String {
     }
 }
 
-/// Emit an error when encountering more or less than one variant in a transparent enum.
+/// Emit an error when encountering two or more variants in a transparent enum.
 fn bad_variant_count<'tcx>(tcx: TyCtxt<'tcx>, adt: &'tcx ty::AdtDef, sp: Span, did: DefId) {
     let variant_spans: Vec<_> = adt
         .variants
@@ -1029,7 +1039,7 @@ fn bad_variant_count<'tcx>(tcx: TyCtxt<'tcx>, adt: &'tcx ty::AdtDef, sp: Span, d
     err.emit();
 }
 
-/// Emit an error when encountering more or less than one non-zero-sized field in a transparent
+/// Emit an error when encountering two or more non-zero-sized fields in a transparent
 /// enum.
 fn bad_non_zero_sized_fields<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -1038,7 +1048,7 @@ fn bad_non_zero_sized_fields<'tcx>(
     field_spans: impl Iterator<Item = Span>,
     sp: Span,
 ) {
-    let msg = format!("needs exactly one non-zero-sized field, but has {}", field_count);
+    let msg = format!("needs at most one non-zero-sized field, but has {}", field_count);
     let mut err = struct_span_err!(
         tcx.sess,
         sp,
@@ -1141,8 +1151,7 @@ impl ItemLikeVisitor<'tcx> for CheckItemTypesVisitor<'tcx> {
     fn visit_foreign_item(&mut self, _: &'tcx hir::ForeignItem<'tcx>) {}
 }
 
-fn typeck_item_bodies(tcx: TyCtxt<'_>, crate_num: CrateNum) {
-    debug_assert!(crate_num == LOCAL_CRATE);
+fn typeck_item_bodies(tcx: TyCtxt<'_>, (): ()) {
     tcx.par_body_owners(|body_owner_def_id| {
         tcx.ensure().typeck(body_owner_def_id);
     });
@@ -1168,4 +1177,15 @@ fn fatally_break_rust(sess: &Session) {
 
 fn potentially_plural_count(count: usize, word: &str) -> String {
     format!("{} {}{}", count, word, pluralize!(count))
+}
+
+fn has_expected_num_generic_args<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    trait_did: Option<DefId>,
+    expected: usize,
+) -> bool {
+    trait_did.map_or(true, |trait_did| {
+        let generics = tcx.generics_of(trait_did);
+        generics.count() == expected + if generics.has_self { 1 } else { 0 }
+    })
 }
